@@ -1,4 +1,4 @@
-# python error_analysis_system.py --acoustic_results /path/to/acoustic_results.csv --video_dataset /path/to/videoset --test_sessions 0901 --output_dir ./error_analysis
+# python error_analysis_system.py --experiment_dir /path/to/experiment --video_dataset /path/to/videoset --test_sessions 0901 --output_dir ./error_analysis --gpu_num 0 --custom_output_path /path/to/custom/output
 
 import os
 import pandas as pd
@@ -19,22 +19,30 @@ from mediapipe_landmark_processor import MediaPipeLandmarkProcessor
 from mediapipe_visualizer import MediaPipeVisualizer
 
 parser = argparse.ArgumentParser(description='Comprehensive Error Analysis for Acoustic vs Vision-based Sign Language Classification')
-parser.add_argument('--acoustic_results', default='', type=str, help='Path to acoustic model results CSV')
+parser.add_argument('--experiment_dir', default='./final_k5fold_testing', type=str, help='Path to experiment directory with existing results')
 parser.add_argument('--video_dataset', default='', type=str, help='Path to video dataset folder')
-parser.add_argument('--test_sessions', default='', type=str, help='Test sessions to analyze')
+parser.add_argument('--test_sessions', default='', type=str, help='Test sessions to analyze (optional for k-fold CV, used for video path resolution)')
 parser.add_argument('--output_dir', default='./error_analysis', type=str, help='Output directory for analysis')
-parser.add_argument('--confidence_threshold', default=0.8, type=float, help='Confidence threshold for error analysis')
 parser.add_argument('--create_visualizations', action='store_true', help='Create video visualizations for error cases')
+parser.add_argument('--fold_number', default=None, type=int, help='Specific fold to analyze (if None, analyzes all folds)')
+parser.add_argument('--gpu_num', default=0, type=int, help='GPU device number to use (default: 0)')
+parser.add_argument('--custom_output_path', default='', type=str, help='Custom output directory path (overrides --output_dir)')
 
 args = parser.parse_args()
 
 # Configuration
-acoustic_results_path = args.acoustic_results
+experiment_dir = args.experiment_dir
 video_dataset_path = args.video_dataset
 test_sessions = args.test_sessions.split(',') if args.test_sessions else []
-output_dir = args.output_dir
-confidence_threshold = args.confidence_threshold
+output_dir = args.custom_output_path if args.custom_output_path else args.output_dir
 create_visualizations = args.create_visualizations
+fold_number = args.fold_number
+gpu_num = args.gpu_num
+
+# Set GPU device
+if gpu_num >= 0:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_num)
+    print(f"Using GPU device: {gpu_num}")
 
 # Create output directory
 os.makedirs(output_dir, exist_ok=True)
@@ -50,26 +58,196 @@ def setup_logging():
         ]
     )
 
+class ExperimentDataExtractor:
+    """Extract data from existing experiment results."""
+    
+    def __init__(self, experiment_dir, fold_number=None):
+        self.experiment_dir = experiment_dir
+        self.fold_number = fold_number
+        self.fold_dirs = self.find_fold_directories()
+        
+    def find_fold_directories(self):
+        """Find all fold directories in the experiment directory."""
+        fold_dirs = []
+        if os.path.exists(self.experiment_dir):
+            for item in os.listdir(self.experiment_dir):
+                item_path = os.path.join(self.experiment_dir, item)
+                if os.path.isdir(item_path) and 'fold_' in item:
+                    fold_dirs.append(item_path)
+        
+        # Sort by fold number
+        fold_dirs.sort(key=lambda x: int(x.split('fold_')[-1]))
+        
+        # Filter by specific fold if requested
+        if self.fold_number is not None:
+            fold_dirs = [d for d in fold_dirs if f'fold_{self.fold_number}' in d]
+        
+        return fold_dirs
+    
+    def extract_results_from_fold(self, fold_dir):
+        """Extract results from a specific fold directory."""
+        results = {
+            'fold_dir': fold_dir,
+            'fold_number': self.extract_fold_number(fold_dir),
+            'test_results': None,
+            'confusion_matrix': None,
+            'log_file': None,
+            'model_path': None
+        }
+        
+        # Look for test results CSV
+        test_results_path = os.path.join(fold_dir, 'test_results.csv')
+        if os.path.exists(test_results_path):
+            results['test_results'] = pd.read_csv(test_results_path)
+            logging.info(f"Loaded test results from {test_results_path}: {len(results['test_results'])} samples")
+        
+        # Look for confusion matrix image
+        cm_path = os.path.join(fold_dir, 'confusion_matrix.png')
+        if os.path.exists(cm_path):
+            results['confusion_matrix'] = cm_path
+        
+        # Look for log file
+        log_path = os.path.join(fold_dir, 'logfile.txt')
+        if os.path.exists(log_path):
+            results['log_file'] = log_path
+        
+        # Look for model file
+        model_path = os.path.join(fold_dir, 'best_model.pth')
+        if os.path.exists(model_path):
+            results['model_path'] = model_path
+        
+        return results
+    
+    def extract_fold_number(self, fold_dir):
+        """Extract fold number from directory name."""
+        try:
+            return int(fold_dir.split('fold_')[-1])
+        except:
+            return 0
+    
+    def extract_all_results(self):
+        """Extract results from all fold directories."""
+        all_results = []
+        
+        for fold_dir in self.fold_dirs:
+            results = self.extract_results_from_fold(fold_dir)
+            all_results.append(results)
+        
+        logging.info(f"Extracted results from {len(all_results)} fold directories")
+        return all_results
+    
+    def extract_error_cases(self, results):
+        """Extract error cases from test results."""
+        error_cases = []
+        
+        for fold_result in results:
+            if fold_result['test_results'] is not None:
+                df = fold_result['test_results']
+                
+                # Find error cases (where True Label != Predicted Label)
+                error_df = df[df['True Label'] != df['Predicted Label']].copy()
+                error_df['Fold'] = fold_result['fold_number']
+                error_df['Fold_Dir'] = fold_result['fold_dir']
+                
+                error_cases.append(error_df)
+        
+        if error_cases:
+            combined_errors = pd.concat(error_cases, ignore_index=True)
+            logging.info(f"Found {len(combined_errors)} total error cases across all folds")
+            return combined_errors
+        else:
+            logging.warning("No error cases found in test results")
+            return pd.DataFrame()
+    
+    def extract_success_cases(self, results):
+        """Extract success cases from test results."""
+        success_cases = []
+        
+        for fold_result in results:
+            if fold_result['test_results'] is not None:
+                df = fold_result['test_results']
+                
+                # Find success cases (where True Label == Predicted Label)
+                success_df = df[df['True Label'] == df['Predicted Label']].copy()
+                success_df['Fold'] = fold_result['fold_number']
+                success_df['Fold_Dir'] = fold_result['fold_dir']
+                
+                success_cases.append(success_df)
+        
+        if success_cases:
+            combined_success = pd.concat(success_cases, ignore_index=True)
+            logging.info(f"Found {len(combined_success)} total success cases across all folds")
+            return combined_success
+        else:
+            logging.warning("No success cases found in test results")
+            return pd.DataFrame()
+    
+    def extract_accuracy_stats(self, results):
+        """Extract accuracy statistics from log files."""
+        accuracy_stats = []
+        
+        for fold_result in results:
+            if fold_result['log_file'] is not None:
+                try:
+                    with open(fold_result['log_file'], 'r') as f:
+                        log_content = f.read()
+                    
+                    # Extract accuracy information
+                    accuracy_info = {
+                        'fold': fold_result['fold_number'],
+                        'log_file': fold_result['log_file']
+                    }
+                    
+                    # Look for accuracy patterns in log
+                    import re
+                    
+                    # Find test accuracy
+                    test_acc_matches = re.findall(r'Test Accuracy: (\d+\.\d+)%', log_content)
+                    if test_acc_matches:
+                        accuracy_info['test_accuracy'] = float(test_acc_matches[-1])
+                    
+                    # Find best accuracy
+                    best_acc_matches = re.findall(r'Best model saved with Test Accuracy: (\d+\.\d+)%', log_content)
+                    if best_acc_matches:
+                        accuracy_info['best_accuracy'] = float(best_acc_matches[-1])
+                    
+                    # Find epoch information
+                    epoch_matches = re.findall(r'Epoch \[(\d+)/(\d+)\]', log_content)
+                    if epoch_matches:
+                        accuracy_info['final_epoch'] = int(epoch_matches[-1][0])
+                        accuracy_info['total_epochs'] = int(epoch_matches[-1][1])
+                    
+                    accuracy_stats.append(accuracy_info)
+                    
+                except Exception as e:
+                    logging.error(f"Error reading log file {fold_result['log_file']}: {e}")
+        
+        return accuracy_stats
+
 class ErrorAnalysisSystem:
     """Comprehensive error analysis system for acoustic vs vision-based classification."""
     
-    def __init__(self, acoustic_results_path, video_dataset_path, output_dir):
-        self.acoustic_results_path = acoustic_results_path
+    def __init__(self, experiment_dir, video_dataset_path, output_dir):
+        self.experiment_dir = experiment_dir
         self.video_dataset_path = video_dataset_path
         self.output_dir = output_dir
         self.processor = MediaPipeLandmarkProcessor()
         self.visualizer = MediaPipeVisualizer()
         
-        # Load acoustic results
-        self.acoustic_results = self.load_acoustic_results()
+        # Extract data from existing experiments
+        self.data_extractor = ExperimentDataExtractor(experiment_dir, fold_number)
+        self.experiment_results = self.data_extractor.extract_all_results()
+        
+        # Extract error and success cases
+        self.error_cases = self.data_extractor.extract_error_cases(self.experiment_results)
+        self.success_cases = self.data_extractor.extract_success_cases(self.experiment_results)
+        self.accuracy_stats = self.data_extractor.extract_accuracy_stats(self.experiment_results)
         
         # Initialize analysis containers
-        self.error_cases = []
-        self.success_cases = []
         self.landmark_analysis = {}
         self.temporal_analysis = {}
         
-        logging.info("Error Analysis System initialized")
+        logging.info("Error Analysis System initialized with existing experiment data")
     
     def load_acoustic_results(self):
         """Load acoustic model results."""
@@ -273,44 +451,66 @@ class ErrorAnalysisSystem:
         return visibility_metrics
     
     def analyze_error_patterns(self):
-        """Analyze patterns in error cases vs success cases."""
-        logging.info("Starting error pattern analysis...")
+        """Analyze patterns in error cases vs success cases from existing results."""
+        logging.info("Starting error pattern analysis from existing results...")
         
-        # Separate error and success cases
-        error_cases = self.acoustic_results[self.acoustic_results['Correct'] == False]
-        success_cases = self.acoustic_results[self.acoustic_results['Correct'] == True]
+        if self.error_cases.empty:
+            logging.warning("No error cases found to analyze")
+            return
         
-        logging.info(f"Found {len(error_cases)} error cases and {len(success_cases)} success cases")
+        if self.success_cases.empty:
+            logging.warning("No success cases found to analyze")
+            return
         
-        # Analyze each case
-        for idx, row in self.acoustic_results.iterrows():
-            video_path = self.find_video_path(row['Video_Name'])
-            if video_path:
-                analysis = self.analyze_single_case(row, video_path)
-                if row['Correct'] == False:
-                    self.error_cases.append(analysis)
-                else:
-                    self.success_cases.append(analysis)
+        logging.info(f"Found {len(self.error_cases)} error cases and {len(self.success_cases)} success cases")
         
         # Generate comparative analysis
         self.generate_comparative_analysis()
+        
+        # Generate fold-wise analysis
+        self.generate_fold_wise_analysis()
+        
+        # Generate label-wise analysis
+        self.generate_label_wise_analysis()
+        
+        # Analyze video patterns for error cases (if video dataset provided)
+        if self.video_dataset_path and os.path.exists(self.video_dataset_path):
+            logging.info("Video dataset found - analyzing video patterns for error cases...")
+            self.analyze_video_patterns_for_errors()
+            
+            # Compare success vs failure cases for specific labels
+            self.compare_success_failure_patterns()
+        else:
+            logging.info("No video dataset provided - skipping video analysis")
     
     def find_video_path(self, video_name):
         """Find the actual video path for a given video name."""
-        for session in test_sessions:
-            session_path = os.path.join(self.video_dataset_path, session, "clips")
-            if os.path.exists(session_path):
-                for file in os.listdir(session_path):
-                    if video_name in file and file.endswith('.mp4'):
-                        return os.path.join(session_path, file)
+        # If test_sessions are specified, use them
+        if test_sessions:
+            for session in test_sessions:
+                session_path = os.path.join(self.video_dataset_path, session, "clips")
+                if os.path.exists(session_path):
+                    for file in os.listdir(session_path):
+                        if video_name in file and file.endswith('.mp4'):
+                            return os.path.join(session_path, file)
+        
+        # For k-fold CV, search all possible session directories
+        if self.video_dataset_path and os.path.exists(self.video_dataset_path):
+            for session_dir in os.listdir(self.video_dataset_path):
+                session_path = os.path.join(self.video_dataset_path, session_dir, "clips")
+                if os.path.exists(session_path):
+                    for file in os.listdir(session_path):
+                        if video_name in file and file.endswith('.mp4'):
+                            return os.path.join(session_path, file)
+        
         return None
     
     def analyze_single_case(self, row, video_path):
         """Analyze a single case (error or success)."""
         case_analysis = {
             'video_name': row['Video_Name'],
-            'true_label': row['True_Label'],
-            'predicted_label': row['Predicted_Label'],
+            'true_label': row['True Label'],
+            'predicted_label': row['Predicted Label'],
             'confidence': row.get('Confidence', 0.0),
             'is_error': not row['Correct'],
             'video_metadata': self.extract_video_metadata(video_path)
@@ -327,9 +527,31 @@ class ErrorAnalysisSystem:
     def process_video_for_analysis(self, video_path):
         """Process video to extract landmarks for analysis."""
         try:
-            # Generate CSV path
-            video_name = os.path.splitext(os.path.basename(video_path))[0]
-            csv_path = f"csv_data/{video_name}_mediapipe_landmarks.csv"
+            # Extract session and video info from path
+            # Expected path: /path/to/videoset/session_0101/clips/sign_12_only_just.mp4
+            path_parts = video_path.split(os.sep)
+            
+            # Find session directory and video name
+            session_dir = None
+            video_name = None
+            
+            for i, part in enumerate(path_parts):
+                if part.startswith('session_'):
+                    session_dir = part
+                    # Video name should be in clips folder
+                    if i + 2 < len(path_parts) and path_parts[i + 1] == 'clips':
+                        video_name = path_parts[i + 2]
+                        break
+            
+            if not session_dir or not video_name:
+                logging.error(f"Could not parse session and video name from path: {video_path}")
+                return None
+            
+            # Generate CSV path in dataset structure
+            # Expected: /path/to/dataset/session_0101/csv/csv_12_only_just.csv
+            dataset_path = self.video_dataset_path.replace('videoset', 'dataset')
+            csv_name = f"csv_{video_name.replace('.mp4', '').replace('.avi', '').replace('.mov', '').replace('.mkv', '')}.csv"
+            csv_path = os.path.join(dataset_path, session_dir, 'csv', csv_name)
             
             # Check if CSV already exists
             if not os.path.exists(csv_path):
@@ -364,6 +586,748 @@ class ErrorAnalysisSystem:
         
         # Save detailed reports
         self.save_analysis_reports(error_df, success_df)
+    
+    def generate_fold_wise_analysis(self):
+        """Generate fold-wise analysis of errors."""
+        logging.info("Generating fold-wise analysis...")
+        
+        if self.error_cases.empty:
+            return
+        
+        # Analyze errors by fold
+        fold_analysis = {}
+        
+        for fold_num in self.error_cases['Fold'].unique():
+            fold_errors = self.error_cases[self.error_cases['Fold'] == fold_num]
+            fold_success = self.success_cases[self.success_cases['Fold'] == fold_num]
+            
+            total_fold_cases = len(fold_errors) + len(fold_success)
+            error_rate = len(fold_errors) / total_fold_cases * 100 if total_fold_cases > 0 else 0
+            
+            fold_analysis[fold_num] = {
+                'error_count': len(fold_errors),
+                'success_count': len(fold_success),
+                'total_cases': total_fold_cases,
+                'error_rate': error_rate,
+                'most_common_errors': fold_errors['True Label'].value_counts().head(5).to_dict()
+            }
+        
+        # Create fold-wise visualization
+        self.plot_fold_wise_analysis(fold_analysis)
+        
+        # Save fold analysis
+        with open(f'{self.output_dir}/fold_wise_analysis.json', 'w') as f:
+            json.dump(fold_analysis, f, indent=2)
+        
+        logging.info("Fold-wise analysis completed")
+    
+    def generate_label_wise_analysis(self):
+        """Generate label-wise analysis of errors."""
+        logging.info("Generating label-wise analysis...")
+        
+        if self.error_cases.empty:
+            return
+        
+        # Analyze errors by true label
+        label_analysis = {}
+        
+        for label in self.error_cases['True Label'].unique():
+            label_errors = self.error_cases[self.error_cases['True Label'] == label]
+            label_success = self.success_cases[self.success_cases['True Label'] == label]
+            
+            total_label_cases = len(label_errors) + len(label_success)
+            error_rate = len(label_errors) / total_label_cases * 100 if total_label_cases > 0 else 0
+            
+            # Most common misclassifications for this label
+            misclassifications = label_errors['Predicted Label'].value_counts().head(5).to_dict()
+            
+            label_analysis[label] = {
+                'error_count': len(label_errors),
+                'success_count': len(label_success),
+                'total_cases': total_label_cases,
+                'error_rate': error_rate,
+                'most_common_misclassifications': misclassifications
+            }
+        
+        # Create label-wise visualization
+        self.plot_label_wise_analysis(label_analysis)
+        
+        # Save label analysis
+        with open(f'{self.output_dir}/label_wise_analysis.json', 'w') as f:
+            json.dump(label_analysis, f, indent=2)
+        
+        logging.info("Label-wise analysis completed")
+    
+    def plot_fold_wise_analysis(self, fold_analysis):
+        """Plot fold-wise error analysis."""
+        if not fold_analysis:
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot 1: Error rate by fold
+        folds = list(fold_analysis.keys())
+        error_rates = [fold_analysis[f]['error_rate'] for f in folds]
+        
+        axes[0, 0].bar(folds, error_rates, color='red', alpha=0.7)
+        axes[0, 0].set_title('Error Rate by Fold')
+        axes[0, 0].set_xlabel('Fold Number')
+        axes[0, 0].set_ylabel('Error Rate (%)')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot 2: Error count by fold
+        error_counts = [fold_analysis[f]['error_count'] for f in folds]
+        success_counts = [fold_analysis[f]['success_count'] for f in folds]
+        
+        x = np.arange(len(folds))
+        width = 0.35
+        
+        axes[0, 1].bar(x - width/2, error_counts, width, label='Errors', color='red', alpha=0.7)
+        axes[0, 1].bar(x + width/2, success_counts, width, label='Success', color='green', alpha=0.7)
+        axes[0, 1].set_title('Error vs Success Count by Fold')
+        axes[0, 1].set_xlabel('Fold Number')
+        axes[0, 1].set_ylabel('Count')
+        axes[0, 1].set_xticks(x)
+        axes[0, 1].set_xticklabels(folds)
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot 3: Total cases by fold
+        total_cases = [fold_analysis[f]['total_cases'] for f in folds]
+        axes[1, 0].bar(folds, total_cases, color='blue', alpha=0.7)
+        axes[1, 0].set_title('Total Cases by Fold')
+        axes[1, 0].set_xlabel('Fold Number')
+        axes[1, 0].set_ylabel('Total Cases')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Plot 4: Average error rate
+        avg_error_rate = np.mean(error_rates)
+        axes[1, 1].axhline(y=avg_error_rate, color='red', linestyle='--', label=f'Average: {avg_error_rate:.1f}%')
+        axes[1, 1].bar(folds, error_rates, color='red', alpha=0.7)
+        axes[1, 1].set_title('Error Rate with Average')
+        axes[1, 1].set_xlabel('Fold Number')
+        axes[1, 1].set_ylabel('Error Rate (%)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.output_dir}/fold_wise_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logging.info("Fold-wise analysis plots saved")
+    
+    def plot_label_wise_analysis(self, label_analysis):
+        """Plot label-wise error analysis."""
+        if not label_analysis:
+            return
+        
+        # Sort labels by error rate
+        sorted_labels = sorted(label_analysis.items(), key=lambda x: x[1]['error_rate'], reverse=True)
+        
+        # Top 20 labels with highest error rates
+        top_labels = sorted_labels[:20]
+        
+        fig, axes = plt.subplots(2, 2, figsize=(20, 15))
+        
+        # Plot 1: Error rate by label (top 20)
+        labels = [item[0] for item in top_labels]
+        error_rates = [item[1]['error_rate'] for item in top_labels]
+        
+        axes[0, 0].barh(labels, error_rates, color='red', alpha=0.7)
+        axes[0, 0].set_title('Error Rate by Label (Top 20)')
+        axes[0, 0].set_xlabel('Error Rate (%)')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot 2: Error count by label (top 20)
+        error_counts = [item[1]['error_count'] for item in top_labels]
+        
+        axes[0, 1].barh(labels, error_counts, color='orange', alpha=0.7)
+        axes[0, 1].set_title('Error Count by Label (Top 20)')
+        axes[0, 1].set_xlabel('Error Count')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot 3: Total cases by label (top 20)
+        total_cases = [item[1]['total_cases'] for item in top_labels]
+        
+        axes[1, 0].barh(labels, total_cases, color='blue', alpha=0.7)
+        axes[1, 0].set_title('Total Cases by Label (Top 20)')
+        axes[1, 0].set_xlabel('Total Cases')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Plot 4: Success vs Error ratio (top 20)
+        success_counts = [item[1]['success_count'] for item in top_labels]
+        
+        x = np.arange(len(labels))
+        width = 0.35
+        
+        axes[1, 1].barh(x - width/2, error_counts, width, label='Errors', color='red', alpha=0.7)
+        axes[1, 1].barh(x + width/2, success_counts, width, label='Success', color='green', alpha=0.7)
+        axes[1, 1].set_title('Success vs Error Count by Label (Top 20)')
+        axes[1, 1].set_xlabel('Count')
+        axes[1, 1].set_yticks(x)
+        axes[1, 1].set_yticklabels(labels)
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.output_dir}/label_wise_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logging.info("Label-wise analysis plots saved")
+    
+    def analyze_video_patterns_for_errors(self):
+        """Analyze video patterns specifically for error cases."""
+        logging.info("Starting video pattern analysis for error cases...")
+        
+        # Create directory for video analysis results
+        video_analysis_dir = f'{self.output_dir}/video_analysis'
+        os.makedirs(video_analysis_dir, exist_ok=True)
+        
+        # Process only error cases for video analysis
+        error_video_analysis = []
+        
+        for idx, error_case in self.error_cases.iterrows():
+            try:
+                video_name = error_case.get('Video_Name', '')
+                if not video_name:
+                    continue
+                
+                video_path = self.find_video_path(video_name)
+                if video_path and os.path.exists(video_path):
+                    logging.info(f"Analyzing video for error case: {video_name}")
+                    
+                    # Analyze video without re-running the model
+                    video_analysis = self.analyze_single_video_case(error_case, video_path, video_analysis_dir)
+                    if video_analysis:
+                        error_video_analysis.append(video_analysis)
+                else:
+                    logging.warning(f"Video not found for error case: {video_name}")
+                    
+            except Exception as e:
+                logging.error(f"Error analyzing video for case {idx}: {e}")
+        
+        # Generate video analysis summary
+        if error_video_analysis:
+            self.generate_video_analysis_summary(error_video_analysis, video_analysis_dir)
+        
+        logging.info(f"Video analysis completed for {len(error_video_analysis)} error cases")
+    
+    def analyze_single_video_case(self, error_case, video_path, output_dir):
+        """Analyze a single video case without re-running the model."""
+        try:
+            video_name = os.path.splitext(os.path.basename(video_path))[0]
+            
+            # Extract video metadata
+            video_metadata = self.extract_video_metadata(video_path)
+            
+            # Process video for landmarks (if not already processed)
+            csv_path = self.process_video_for_analysis(video_path)
+            
+            video_analysis = {
+                'video_name': video_name,
+                'true_label': error_case['True Label'],
+                'predicted_label': error_case['Predicted Label'],
+                'fold': error_case.get('Fold', 'Unknown'),
+                'video_metadata': video_metadata,
+                'landmark_analysis': None,
+                'motion_metrics': {},
+                'visualization_path': None
+            }
+            
+            # Analyze landmarks if CSV exists
+            if csv_path and os.path.exists(csv_path):
+                landmark_analysis = self.analyze_landmark_patterns(csv_path)
+                video_analysis['landmark_analysis'] = landmark_analysis
+                
+                # Extract motion metrics
+                if landmark_analysis:
+                    video_analysis['motion_metrics'] = {
+                        'hand_motion': landmark_analysis.get('hand_motion', {}),
+                        'pose_motion': landmark_analysis.get('pose_motion', {}),
+                        'face_motion': landmark_analysis.get('face_motion', {})
+                    }
+            
+            # Create visualization if requested
+            if create_visualizations and csv_path and os.path.exists(csv_path):
+                viz_path = f"{output_dir}/{video_name}_error_analysis.mp4"
+                try:
+                    self.visualizer.create_landmark_visualization_from_csv(
+                        video_path, csv_path, viz_path
+                    )
+                    video_analysis['visualization_path'] = viz_path
+                    logging.info(f"Created visualization: {viz_path}")
+                except Exception as e:
+                    logging.error(f"Error creating visualization for {video_name}: {e}")
+            
+            return video_analysis
+            
+        except Exception as e:
+            logging.error(f"Error analyzing video case {video_name}: {e}")
+            return None
+    
+    def generate_video_analysis_summary(self, video_analyses, output_dir):
+        """Generate summary of video analysis results."""
+        logging.info("Generating video analysis summary...")
+        
+        # Extract motion metrics
+        hand_motions = []
+        pose_motions = []
+        face_motions = []
+        
+        for analysis in video_analyses:
+            if analysis['motion_metrics']:
+                hand_motions.append(analysis['motion_metrics'].get('hand_motion', {}))
+                pose_motions.append(analysis['motion_metrics'].get('pose_motion', {}))
+                face_motions.append(analysis['motion_metrics'].get('face_motion', {}))
+        
+        # Calculate motion statistics
+        motion_summary = {
+            'total_error_videos_analyzed': len(video_analyses),
+            'videos_with_motion_data': len(hand_motions),
+            'hand_motion_stats': self.calculate_motion_statistics(hand_motions),
+            'pose_motion_stats': self.calculate_motion_statistics(pose_motions),
+            'face_motion_stats': self.calculate_motion_statistics(face_motions)
+        }
+        
+        # Save motion summary
+        with open(f'{output_dir}/motion_analysis_summary.json', 'w') as f:
+            json.dump(motion_summary, f, indent=2)
+        
+        # Create motion visualization
+        self.plot_error_case_motion_analysis(video_analyses, output_dir)
+        
+        # Generate detailed video analysis report
+        self.generate_detailed_video_report(video_analyses, output_dir)
+        
+        logging.info("Video analysis summary generated")
+    
+    def calculate_motion_statistics(self, motion_data):
+        """Calculate statistics from motion data."""
+        if not motion_data:
+            return {}
+        
+        # Extract velocity data
+        velocities = []
+        for motion in motion_data:
+            if 'mean_velocity' in motion:
+                velocities.append(motion['mean_velocity'])
+        
+        if velocities:
+            return {
+                'mean_velocity': np.mean(velocities),
+                'std_velocity': np.std(velocities),
+                'min_velocity': np.min(velocities),
+                'max_velocity': np.max(velocities),
+                'sample_count': len(velocities)
+            }
+        else:
+            return {}
+    
+    def plot_error_case_motion_analysis(self, video_analyses, output_dir):
+        """Plot motion analysis for error cases."""
+        if not video_analyses:
+            return
+        
+        # Extract motion data
+        hand_velocities = []
+        pose_velocities = []
+        face_velocities = []
+        labels = []
+        
+        for analysis in video_analyses:
+            if analysis['motion_metrics']:
+                hand_motion = analysis['motion_metrics'].get('hand_motion', {})
+                pose_motion = analysis['motion_metrics'].get('pose_motion', {})
+                face_motion = analysis['motion_metrics'].get('face_motion', {})
+                
+                hand_velocities.append(hand_motion.get('mean_velocity', 0))
+                pose_velocities.append(pose_motion.get('mean_velocity', 0))
+                face_velocities.append(face_motion.get('mean_velocity', 0))
+                labels.append(f"{analysis['true_label']}→{analysis['predicted_label']}")
+        
+        if not hand_velocities:
+            return
+        
+        # Create motion analysis plots
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot 1: Hand motion distribution
+        axes[0, 0].hist(hand_velocities, bins=20, alpha=0.7, color='blue')
+        axes[0, 0].set_title('Hand Motion Velocity Distribution (Error Cases)')
+        axes[0, 0].set_xlabel('Mean Velocity')
+        axes[0, 0].set_ylabel('Frequency')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot 2: Pose motion distribution
+        axes[0, 1].hist(pose_velocities, bins=20, alpha=0.7, color='green')
+        axes[0, 1].set_title('Pose Motion Velocity Distribution (Error Cases)')
+        axes[0, 1].set_xlabel('Mean Velocity')
+        axes[0, 1].set_ylabel('Frequency')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot 3: Face motion distribution
+        axes[1, 0].hist(face_velocities, bins=20, alpha=0.7, color='red')
+        axes[1, 0].set_title('Face Motion Velocity Distribution (Error Cases)')
+        axes[1, 0].set_xlabel('Mean Velocity')
+        axes[1, 0].set_ylabel('Frequency')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Plot 4: Motion comparison
+        motion_types = ['Hand', 'Pose', 'Face']
+        motion_means = [np.mean(hand_velocities), np.mean(pose_velocities), np.mean(face_velocities)]
+        
+        axes[1, 1].bar(motion_types, motion_means, color=['blue', 'green', 'red'], alpha=0.7)
+        axes[1, 1].set_title('Average Motion Velocity by Type (Error Cases)')
+        axes[1, 1].set_ylabel('Mean Velocity')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/error_case_motion_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logging.info("Error case motion analysis plots saved")
+    
+    def generate_detailed_video_report(self, video_analyses, output_dir):
+        """Generate detailed video analysis report."""
+        logging.info("Generating detailed video analysis report...")
+        
+        # Create detailed report
+        report_data = []
+        
+        for analysis in video_analyses:
+            report_entry = {
+                'video_name': analysis['video_name'],
+                'true_label': analysis['true_label'],
+                'predicted_label': analysis['predicted_label'],
+                'fold': analysis['fold'],
+                'video_duration': analysis['video_metadata'].get('duration', 'N/A'),
+                'frame_count': analysis['video_metadata'].get('frame_count', 'N/A'),
+                'hand_mean_velocity': analysis['motion_metrics'].get('hand_motion', {}).get('mean_velocity', 'N/A'),
+                'pose_mean_velocity': analysis['motion_metrics'].get('pose_motion', {}).get('mean_velocity', 'N/A'),
+                'face_mean_velocity': analysis['motion_metrics'].get('face_motion', {}).get('mean_velocity', 'N/A'),
+                'visualization_path': analysis.get('visualization_path', 'N/A')
+            }
+            report_data.append(report_entry)
+        
+        # Save detailed report
+        report_df = pd.DataFrame(report_data)
+        report_df.to_csv(f'{output_dir}/detailed_video_analysis.csv', index=False)
+        
+        # Generate markdown report
+        with open(f'{output_dir}/video_analysis_report.md', 'w') as f:
+            f.write("# Video Analysis Report for Error Cases\n\n")
+            f.write(f"**Total Error Videos Analyzed:** {len(video_analyses)}\n\n")
+            
+            f.write("## Motion Analysis Summary\n\n")
+            
+            # Calculate motion statistics
+            hand_velocities = [a['motion_metrics'].get('hand_motion', {}).get('mean_velocity', 0) 
+                             for a in video_analyses if a['motion_metrics']]
+            pose_velocities = [a['motion_metrics'].get('pose_motion', {}).get('mean_velocity', 0) 
+                             for a in video_analyses if a['motion_metrics']]
+            face_velocities = [a['motion_metrics'].get('face_motion', {}).get('mean_velocity', 0) 
+                             for a in video_analyses if a['motion_metrics']]
+            
+            if hand_velocities:
+                f.write(f"- **Hand Motion:** Mean = {np.mean(hand_velocities):.3f}, Std = {np.std(hand_velocities):.3f}\n")
+            if pose_velocities:
+                f.write(f"- **Pose Motion:** Mean = {np.mean(pose_velocities):.3f}, Std = {np.std(pose_velocities):.3f}\n")
+            if face_velocities:
+                f.write(f"- **Face Motion:** Mean = {np.mean(face_velocities):.3f}, Std = {np.std(face_velocities):.3f}\n")
+            
+            f.write("\n## Error Case Details\n\n")
+            f.write("| Video | True Label | Predicted Label | Fold | Hand Motion | Pose Motion | Face Motion |\n")
+            f.write("|-------|------------|-----------------|------|-------------|-------------|-------------|\n")
+            
+            for analysis in video_analyses:
+                hand_vel = analysis['motion_metrics'].get('hand_motion', {}).get('mean_velocity', 'N/A')
+                pose_vel = analysis['motion_metrics'].get('pose_motion', {}).get('mean_velocity', 'N/A')
+                face_vel = analysis['motion_metrics'].get('face_motion', {}).get('mean_velocity', 'N/A')
+                
+                f.write(f"| {analysis['video_name']} | {analysis['true_label']} | {analysis['predicted_label']} | "
+                       f"{analysis['fold']} | {hand_vel} | {pose_vel} | {face_vel} |\n")
+        
+        logging.info("Detailed video analysis report generated")
+    
+    def compare_success_failure_patterns(self):
+        """Compare motion patterns between success and failure cases for specific labels."""
+        logging.info("Starting success vs failure pattern comparison...")
+        
+        # Create directory for comparison results
+        comparison_dir = f'{self.output_dir}/success_failure_comparison'
+        os.makedirs(comparison_dir, exist_ok=True)
+        
+        # Get all unique labels involved in errors
+        error_labels = set()
+        for _, error_case in self.error_cases.iterrows():
+            error_labels.add(error_case['True Label'])
+            error_labels.add(error_case['Predicted Label'])
+        
+        logging.info(f"Found {len(error_labels)} unique labels involved in errors")
+        
+        # Analyze each label
+        label_comparisons = {}
+        
+        for label in error_labels:
+            logging.info(f"Analyzing success vs failure patterns for label: {label}")
+            
+            # Get error cases where this label was the true label
+            label_errors = self.error_cases[self.error_cases['True Label'] == label]
+            
+            # Get success cases where this label was correctly classified
+            label_successes = self.success_cases[self.success_cases['True Label'] == label]
+            
+            if len(label_errors) > 0 and len(label_successes) > 0:
+                comparison = self.compare_label_success_failure(label, label_errors, label_successes, comparison_dir)
+                if comparison:
+                    label_comparisons[label] = comparison
+        
+        # Generate overall comparison summary
+        if label_comparisons:
+            self.generate_comparison_summary(label_comparisons, comparison_dir)
+        
+        logging.info(f"Success vs failure comparison completed for {len(label_comparisons)} labels")
+    
+    def compare_label_success_failure(self, label, label_errors, label_successes, output_dir):
+        """Compare success vs failure cases for a specific label."""
+        try:
+            # Process error cases for this label
+            error_video_analyses = []
+            for _, error_case in label_errors.iterrows():
+                video_name = error_case.get('Video_Name', '')
+                if video_name:
+                    video_path = self.find_video_path(video_name)
+                    if video_path and os.path.exists(video_path):
+                        analysis = self.analyze_single_video_case(error_case, video_path, output_dir)
+                        if analysis:
+                            error_video_analyses.append(analysis)
+            
+            # Process success cases for this label
+            success_video_analyses = []
+            for _, success_case in label_successes.iterrows():
+                video_name = success_case.get('Video_Name', '')
+                if video_name:
+                    video_path = self.find_video_path(video_name)
+                    if video_path and os.path.exists(video_path):
+                        analysis = self.analyze_single_video_case(success_case, video_path, output_dir)
+                        if analysis:
+                            success_video_analyses.append(analysis)
+            
+            # Compare motion patterns
+            comparison = self.compare_motion_patterns(label, error_video_analyses, success_video_analyses, output_dir)
+            
+            return comparison
+            
+        except Exception as e:
+            logging.error(f"Error comparing success/failure for label {label}: {e}")
+            return None
+    
+    def compare_motion_patterns(self, label, error_analyses, success_analyses, output_dir):
+        """Compare motion patterns between error and success cases for a label."""
+        if not error_analyses or not success_analyses:
+            return None
+        
+        # Extract motion metrics
+        error_hand_velocities = []
+        error_pose_velocities = []
+        error_face_velocities = []
+        
+        success_hand_velocities = []
+        success_pose_velocities = []
+        success_face_velocities = []
+        
+        # Extract error motion data
+        for analysis in error_analyses:
+            if analysis['motion_metrics']:
+                hand_motion = analysis['motion_metrics'].get('hand_motion', {})
+                pose_motion = analysis['motion_metrics'].get('pose_motion', {})
+                face_motion = analysis['motion_metrics'].get('face_motion', {})
+                
+                error_hand_velocities.append(hand_motion.get('mean_velocity', 0))
+                error_pose_velocities.append(pose_motion.get('mean_velocity', 0))
+                error_face_velocities.append(face_motion.get('mean_velocity', 0))
+        
+        # Extract success motion data
+        for analysis in success_analyses:
+            if analysis['motion_metrics']:
+                hand_motion = analysis['motion_metrics'].get('hand_motion', {})
+                pose_motion = analysis['motion_metrics'].get('pose_motion', {})
+                face_motion = analysis['motion_metrics'].get('face_motion', {})
+                
+                success_hand_velocities.append(hand_motion.get('mean_velocity', 0))
+                success_pose_velocities.append(pose_motion.get('mean_velocity', 0))
+                success_face_velocities.append(face_motion.get('mean_velocity', 0))
+        
+        # Calculate statistics
+        comparison = {
+            'label': label,
+            'error_count': len(error_analyses),
+            'success_count': len(success_analyses),
+            'hand_motion': {
+                'error_mean': np.mean(error_hand_velocities) if error_hand_velocities else 0,
+                'error_std': np.std(error_hand_velocities) if error_hand_velocities else 0,
+                'success_mean': np.mean(success_hand_velocities) if success_hand_velocities else 0,
+                'success_std': np.std(success_hand_velocities) if success_hand_velocities else 0,
+                'difference': (np.mean(error_hand_velocities) if error_hand_velocities else 0) - 
+                            (np.mean(success_hand_velocities) if success_hand_velocities else 0)
+            },
+            'pose_motion': {
+                'error_mean': np.mean(error_pose_velocities) if error_pose_velocities else 0,
+                'error_std': np.std(error_pose_velocities) if error_pose_velocities else 0,
+                'success_mean': np.mean(success_pose_velocities) if success_pose_velocities else 0,
+                'success_std': np.std(success_pose_velocities) if success_pose_velocities else 0,
+                'difference': (np.mean(error_pose_velocities) if error_pose_velocities else 0) - 
+                            (np.mean(success_pose_velocities) if success_pose_velocities else 0)
+            },
+            'face_motion': {
+                'error_mean': np.mean(error_face_velocities) if error_face_velocities else 0,
+                'error_std': np.std(error_face_velocities) if error_face_velocities else 0,
+                'success_mean': np.mean(success_face_velocities) if success_face_velocities else 0,
+                'success_std': np.std(success_face_velocities) if success_face_velocities else 0,
+                'difference': (np.mean(error_face_velocities) if error_face_velocities else 0) - 
+                            (np.mean(success_face_velocities) if success_face_velocities else 0)
+            }
+        }
+        
+        # Create visualization for this label
+        self.plot_label_comparison(label, comparison, error_hand_velocities, success_hand_velocities,
+                                 error_pose_velocities, success_pose_velocities,
+                                 error_face_velocities, success_face_velocities, output_dir)
+        
+        return comparison
+    
+    def plot_label_comparison(self, label, comparison, error_hand, success_hand, 
+                            error_pose, success_pose, error_face, success_face, output_dir):
+        """Create comparison plots for a specific label."""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot 1: Hand motion comparison
+        if error_hand and success_hand:
+            axes[0, 0].hist(error_hand, bins=15, alpha=0.7, label='Error Cases', color='red')
+            axes[0, 0].hist(success_hand, bins=15, alpha=0.7, label='Success Cases', color='green')
+            axes[0, 0].set_title(f'Hand Motion Comparison - {label}')
+            axes[0, 0].set_xlabel('Mean Velocity')
+            axes[0, 0].set_ylabel('Frequency')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot 2: Pose motion comparison
+        if error_pose and success_pose:
+            axes[0, 1].hist(error_pose, bins=15, alpha=0.7, label='Error Cases', color='red')
+            axes[0, 1].hist(success_pose, bins=15, alpha=0.7, label='Success Cases', color='green')
+            axes[0, 1].set_title(f'Pose Motion Comparison - {label}')
+            axes[0, 1].set_xlabel('Mean Velocity')
+            axes[0, 1].set_ylabel('Frequency')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot 3: Face motion comparison
+        if error_face and success_face:
+            axes[1, 0].hist(error_face, bins=15, alpha=0.7, label='Error Cases', color='red')
+            axes[1, 0].hist(success_face, bins=15, alpha=0.7, label='Success Cases', color='green')
+            axes[1, 0].set_title(f'Face Motion Comparison - {label}')
+            axes[1, 0].set_xlabel('Mean Velocity')
+            axes[1, 0].set_ylabel('Frequency')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+        
+        # Plot 4: Motion difference summary
+        motion_types = ['Hand', 'Pose', 'Face']
+        differences = [
+            comparison['hand_motion']['difference'],
+            comparison['pose_motion']['difference'],
+            comparison['face_motion']['difference']
+        ]
+        
+        colors = ['red' if d > 0 else 'blue' for d in differences]
+        axes[1, 1].bar(motion_types, differences, color=colors, alpha=0.7)
+        axes[1, 1].set_title(f'Motion Difference (Error - Success) - {label}')
+        axes[1, 1].set_ylabel('Velocity Difference')
+        axes[1, 1].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/{label}_success_failure_comparison.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logging.info(f"Comparison plots saved for label: {label}")
+    
+    def generate_comparison_summary(self, label_comparisons, output_dir):
+        """Generate summary of all label comparisons."""
+        logging.info("Generating comparison summary...")
+        
+        # Create summary report
+        summary_data = []
+        
+        for label, comparison in label_comparisons.items():
+            summary_entry = {
+                'label': label,
+                'error_count': comparison['error_count'],
+                'success_count': comparison['success_count'],
+                'hand_motion_error_mean': comparison['hand_motion']['error_mean'],
+                'hand_motion_success_mean': comparison['hand_motion']['success_mean'],
+                'hand_motion_difference': comparison['hand_motion']['difference'],
+                'pose_motion_error_mean': comparison['pose_motion']['error_mean'],
+                'pose_motion_success_mean': comparison['pose_motion']['success_mean'],
+                'pose_motion_difference': comparison['pose_motion']['difference'],
+                'face_motion_error_mean': comparison['face_motion']['error_mean'],
+                'face_motion_success_mean': comparison['face_motion']['success_mean'],
+                'face_motion_difference': comparison['face_motion']['difference']
+            }
+            summary_data.append(summary_entry)
+        
+        # Save summary CSV
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_csv(f'{output_dir}/label_comparison_summary.csv', index=False)
+        
+        # Generate markdown report
+        with open(f'{output_dir}/success_failure_comparison_report.md', 'w') as f:
+            f.write("# Success vs Failure Motion Pattern Comparison\n\n")
+            f.write(f"**Total Labels Analyzed:** {len(label_comparisons)}\n\n")
+            
+            f.write("## Key Findings\n\n")
+            
+            # Find labels with significant differences
+            significant_labels = []
+            for label, comp in label_comparisons.items():
+                hand_diff = abs(comp['hand_motion']['difference'])
+                pose_diff = abs(comp['pose_motion']['difference'])
+                face_diff = abs(comp['face_motion']['difference'])
+                
+                if hand_diff > 0.1 or pose_diff > 0.1 or face_diff > 0.1:
+                    significant_labels.append((label, hand_diff + pose_diff + face_diff))
+            
+            if significant_labels:
+                significant_labels.sort(key=lambda x: x[1], reverse=True)
+                f.write("### Labels with Significant Motion Differences\n\n")
+                for label, total_diff in significant_labels[:10]:
+                    comp = label_comparisons[label]
+                    f.write(f"#### {label}\n")
+                    f.write(f"- **Hand Motion:** Error={comp['hand_motion']['error_mean']:.3f}, "
+                           f"Success={comp['hand_motion']['success_mean']:.3f}, "
+                           f"Diff={comp['hand_motion']['difference']:.3f}\n")
+                    f.write(f"- **Pose Motion:** Error={comp['pose_motion']['error_mean']:.3f}, "
+                           f"Success={comp['pose_motion']['success_mean']:.3f}, "
+                           f"Diff={comp['pose_motion']['difference']:.3f}\n")
+                    f.write(f"- **Face Motion:** Error={comp['face_motion']['error_mean']:.3f}, "
+                           f"Success={comp['face_motion']['success_mean']:.3f}, "
+                           f"Diff={comp['face_motion']['difference']:.3f}\n\n")
+            
+            f.write("## Detailed Comparison Table\n\n")
+            f.write("| Label | Error Count | Success Count | Hand Diff | Pose Diff | Face Diff |\n")
+            f.write("|-------|-------------|---------------|-----------|-----------|-----------|\n")
+            
+            for label, comp in label_comparisons.items():
+                f.write(f"| {label} | {comp['error_count']} | {comp['success_count']} | "
+                       f"{comp['hand_motion']['difference']:.3f} | "
+                       f"{comp['pose_motion']['difference']:.3f} | "
+                       f"{comp['face_motion']['difference']:.3f} |\n")
+        
+        # Save detailed comparison data
+        with open(f'{output_dir}/detailed_comparison_data.json', 'w') as f:
+            json.dump(label_comparisons, f, indent=2)
+        
+        logging.info("Comparison summary generated")
     
     def analyze_motion_patterns(self, error_df, success_df):
         """Analyze motion patterns in error vs success cases."""
@@ -656,37 +1620,34 @@ class ErrorAnalysisSystem:
         logging.info("Saving analysis reports...")
         
         # 1. Summary statistics
+        total_cases = len(self.error_cases) + len(self.success_cases)
+        error_rate = len(self.error_cases) / total_cases * 100 if total_cases > 0 else 0
+        success_rate = len(self.success_cases) / total_cases * 100 if total_cases > 0 else 0
+        
         summary_stats = {
-            'total_cases': len(self.acoustic_results),
+            'total_cases': total_cases,
             'error_cases': len(self.error_cases),
             'success_cases': len(self.success_cases),
-            'error_rate': len(self.error_cases) / len(self.acoustic_results) * 100,
-            'success_rate': len(self.success_cases) / len(self.acoustic_results) * 100
+            'error_rate': error_rate,
+            'success_rate': success_rate,
+            'accuracy_stats': self.accuracy_stats
         }
         
         with open(f'{self.output_dir}/summary_statistics.json', 'w') as f:
             json.dump(summary_stats, f, indent=2)
         
-        # 2. Detailed error analysis
-        error_details = []
-        for case in self.error_cases:
-            error_details.append({
-                'video_name': case['video_name'],
-                'true_label': case['true_label'],
-                'predicted_label': case['predicted_label'],
-                'confidence': case['confidence'],
-                'motion_analysis': case.get('landmark_analysis', {}),
-                'video_metadata': case.get('video_metadata', {})
-            })
+        # 2. Save error and success cases
+        if not self.error_cases.empty:
+            self.error_cases.to_csv(f'{self.output_dir}/error_cases.csv', index=False)
         
-        error_df = pd.DataFrame(error_details)
-        error_df.to_csv(f'{self.output_dir}/detailed_error_analysis.csv', index=False)
+        if not self.success_cases.empty:
+            self.success_cases.to_csv(f'{self.output_dir}/success_cases.csv', index=False)
         
         # 3. Comparative analysis report
         comparison_report = {
-            'motion_analysis': self.motion_analysis,
-            'visibility_analysis': self.visibility_analysis,
-            'temporal_analysis': self.temporal_analysis
+            'motion_analysis': getattr(self, 'motion_analysis', {}),
+            'visibility_analysis': getattr(self, 'visibility_analysis', {}),
+            'temporal_analysis': getattr(self, 'temporal_analysis', {})
         }
         
         with open(f'{self.output_dir}/comparative_analysis.json', 'w') as f:
@@ -695,7 +1656,74 @@ class ErrorAnalysisSystem:
         # 4. Key findings report
         self.generate_key_findings_report()
         
+        # 5. Experiment summary
+        self.generate_experiment_summary()
+        
         logging.info("Analysis reports saved")
+    
+    def generate_experiment_summary(self):
+        """Generate a summary of the experiment results."""
+        logging.info("Generating experiment summary...")
+        
+        summary = {
+            'experiment_directory': self.experiment_dir,
+            'total_folds_analyzed': len(self.experiment_results),
+            'fold_directories': [r['fold_dir'] for r in self.experiment_results],
+            'accuracy_by_fold': {}
+        }
+        
+        # Add accuracy by fold
+        for stat in self.accuracy_stats:
+            fold_num = stat['fold']
+            summary['accuracy_by_fold'][fold_num] = {
+                'test_accuracy': stat.get('test_accuracy', 'N/A'),
+                'best_accuracy': stat.get('best_accuracy', 'N/A'),
+                'final_epoch': stat.get('final_epoch', 'N/A'),
+                'total_epochs': stat.get('total_epochs', 'N/A')
+            }
+        
+        # Calculate overall statistics
+        if self.accuracy_stats:
+            accuracies = [s.get('best_accuracy', 0) for s in self.accuracy_stats if s.get('best_accuracy')]
+            if accuracies:
+                summary['overall_statistics'] = {
+                    'mean_accuracy': np.mean(accuracies),
+                    'std_accuracy': np.std(accuracies),
+                    'min_accuracy': np.min(accuracies),
+                    'max_accuracy': np.max(accuracies)
+                }
+        
+        # Save experiment summary
+        with open(f'{self.output_dir}/experiment_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        # Generate markdown summary
+        with open(f'{self.output_dir}/experiment_summary.md', 'w') as f:
+            f.write("# Experiment Summary\n\n")
+            f.write(f"**Experiment Directory:** {self.experiment_dir}\n\n")
+            f.write(f"**Total Folds Analyzed:** {len(self.experiment_results)}\n\n")
+            
+            f.write("## Accuracy by Fold\n\n")
+            for fold_num, acc_info in summary['accuracy_by_fold'].items():
+                f.write(f"### Fold {fold_num}\n")
+                f.write(f"- Test Accuracy: {acc_info['test_accuracy']}%\n")
+                f.write(f"- Best Accuracy: {acc_info['best_accuracy']}%\n")
+                f.write(f"- Final Epoch: {acc_info['final_epoch']}/{acc_info['total_epochs']}\n\n")
+            
+            if 'overall_statistics' in summary:
+                overall = summary['overall_statistics']
+                f.write("## Overall Statistics\n\n")
+                f.write(f"- Mean Accuracy: {overall['mean_accuracy']:.2f}%\n")
+                f.write(f"- Standard Deviation: {overall['std_accuracy']:.2f}%\n")
+                f.write(f"- Min Accuracy: {overall['min_accuracy']:.2f}%\n")
+                f.write(f"- Max Accuracy: {overall['max_accuracy']:.2f}%\n\n")
+            
+            f.write("## Error Analysis Summary\n\n")
+            f.write(f"- Total Cases: {len(self.error_cases) + len(self.success_cases)}\n")
+            f.write(f"- Error Cases: {len(self.error_cases)} ({len(self.error_cases)/(len(self.error_cases) + len(self.success_cases))*100:.1f}%)\n")
+            f.write(f"- Success Cases: {len(self.success_cases)} ({len(self.success_cases)/(len(self.error_cases) + len(self.success_cases))*100:.1f}%)\n")
+        
+        logging.info("Experiment summary generated")
     
     def generate_key_findings_report(self):
         """Generate a key findings report for the research paper."""
@@ -762,11 +1790,11 @@ def main():
     setup_logging()
     
     logging.info("="*50)
-    logging.info("Starting Comprehensive Error Analysis")
+    logging.info("Starting Comprehensive Error Analysis from Existing Results")
     logging.info("="*50)
     
     # Initialize error analysis system
-    analyzer = ErrorAnalysisSystem(acoustic_results_path, video_dataset_path, output_dir)
+    analyzer = ErrorAnalysisSystem(experiment_dir, video_dataset_path, output_dir)
     
     # Run comprehensive analysis
     analyzer.analyze_error_patterns()

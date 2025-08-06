@@ -1,17 +1,40 @@
+# MediaPipe Visualizer - Create video visualizations with MediaPipe landmarks
+# 
+# Example usage:
+# 
+# Single video processing:
+# python mediapipe_visualizer.py --video_path /path/to/video.mp4 --csv_path /path/to/landmarks.csv --output /path/to/output.mp4 --gpu_num 0
+# 
+# Batch processing (process all videos in videoset):
+# python mediapipe_visualizer.py --videoset_path /path/to/videoset --dataset_path /path/to/dataset --gpu_num 1
+# 
+# Batch processing with force reprocess:
+# python mediapipe_visualizer.py --videoset_path /path/to/videoset --dataset_path /path/to/dataset --force_reprocess --gpu_num 2
+
 import cv2
 import mediapipe as mp
 import numpy as np
 import pandas as pd
 import argparse
 import os
+import logging
 from pathlib import Path
 from typing import List, Dict, Any
+from tqdm import tqdm
 
 class MediaPipeVisualizer:
-    def __init__(self):
+    def __init__(self, gpu_num: int = 0):
         """
         Initialize MediaPipe Visualizer with official Google drawing utilities
+        
+        Args:
+            gpu_num: GPU device number to use (default: 0)
         """
+        # Set GPU device
+        if gpu_num >= 0:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_num)
+            print(f"Using GPU device: {gpu_num}")
+        
         self.mp_pose = mp.solutions.pose
         self.mp_face_mesh = mp.solutions.face_mesh
         self.mp_hands = mp.solutions.hands
@@ -143,7 +166,7 @@ class MediaPipeVisualizer:
         
         return landmarks
     
-    def create_landmark_visualization_from_csv(self, video_path: str, csv_path: str, output_path: str, fps: int = 30):
+    def create_landmark_visualization_from_csv(self, video_path: str, csv_path: str, output_path: str, fps: int = None):
         """
         Create video visualization from CSV MediaPipe landmarks
         """
@@ -164,8 +187,12 @@ class MediaPipeVisualizer:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
+        # Use original FPS if not specified
+        if fps is None:
+            fps = orig_fps
+        
         print(f"Video properties: {width}x{height} @ {orig_fps}fps, {total_frames} frames")
-        print(f"Target output FPS: {fps}")
+        print(f"Output FPS: {fps}")
         print(f"Crop region: x={self.CROP_COORDINATES['x_start']}, y={self.CROP_COORDINATES['y_start']}, w={self.CROP_COORDINATES['width']}, h={self.CROP_COORDINATES['height']}")
         
         # Process all frames without skipping to avoid delay
@@ -438,28 +465,199 @@ class MediaPipeVisualizer:
                 y = int(landmark.y * h)
                 cv2.circle(image, (x, y), 3, (0, 255, 255), -1)
 
+    def find_video_files(self, videoset_path: str) -> List[Dict[str, str]]:
+        """Find all video files in the videoset directory."""
+        video_files = []
+        
+        if not os.path.exists(videoset_path):
+            logging.error(f"Videoset path does not exist: {videoset_path}")
+            return video_files
+        
+        # Walk through all session folders
+        for session_dir in os.listdir(videoset_path):
+            session_path = os.path.join(videoset_path, session_dir)
+            
+            if os.path.isdir(session_path) and session_dir.startswith('session_'):
+                clips_path = os.path.join(session_path, 'clips')
+                
+                if os.path.exists(clips_path):
+                    # Find all video files in clips folder
+                    for video_file in os.listdir(clips_path):
+                        if video_file.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                            video_path = os.path.join(clips_path, video_file)
+                            video_files.append({
+                                'video_path': video_path,
+                                'session_dir': session_dir,
+                                'video_name': video_file,
+                                'csv_name': f"csv_{video_file.replace('.mp4', '').replace('.avi', '').replace('.mov', '').replace('.mkv', '')}.csv"
+                            })
+        
+        logging.info(f"Found {len(video_files)} video files to process")
+        return video_files
+    
+    def create_mediapipe_videos_directory(self, videoset_path: str, session_dir: str) -> str:
+        """Create mediapipe_videos directory for a session if it doesn't exist."""
+        session_mediapipe_path = os.path.join(videoset_path, session_dir, 'mediapipe_videos')
+        os.makedirs(session_mediapipe_path, exist_ok=True)
+        return session_mediapipe_path
+    
+    def process_all_videos(self, videoset_path: str, dataset_path: str, force_reprocess: bool = False) -> Dict[str, int]:
+        """Process all videos in the videoset and generate MediaPipe visualizations."""
+        logging.info("Starting batch video visualization...")
+        
+        # Validate path structure
+        if not videoset_path.endswith('/videoset'):
+            logging.warning(f"Videoset path should end with '/videoset', got: {videoset_path}")
+        
+        if not dataset_path.endswith('/dataset'):
+            logging.warning(f"Dataset path should end with '/dataset', got: {dataset_path}")
+        
+        if not os.path.exists(videoset_path):
+            logging.error(f"Videoset path does not exist: {videoset_path}")
+            return {'processed': 0, 'skipped': 0, 'errors': 0}
+        
+        if not os.path.exists(dataset_path):
+            logging.error(f"Dataset path does not exist: {dataset_path}")
+            return {'processed': 0, 'skipped': 0, 'errors': 0}
+        
+        # Find all video files
+        video_files = self.find_video_files(videoset_path)
+        
+        if not video_files:
+            logging.error("No video files found to process")
+            return {'processed': 0, 'skipped': 0, 'errors': 0}
+        
+        logging.info(f"Found {len(video_files)} videos to process")
+        
+        # Process videos
+        processed_count = 0
+        skipped_count = 0
+        error_count = 0
+        
+        # Create progress bar
+        pbar = tqdm(video_files, desc="Creating visualizations")
+        
+        for video_info in pbar:
+            video_path = video_info['video_path']
+            session_dir = video_info['session_dir']
+            csv_name = video_info['csv_name']
+            
+            # Create mediapipe_videos directory for this session
+            mediapipe_dir = self.create_mediapipe_videos_directory(videoset_path, session_dir)
+            
+            # Construct CSV path
+            csv_path = os.path.join(dataset_path, session_dir, 'csv', csv_name)
+            
+            # Construct output video path
+            output_video_name = f"mediapipe_{video_info['video_name']}"
+            output_video_path = os.path.join(mediapipe_dir, output_video_name)
+            
+            # Update progress bar description
+            pbar.set_description(f"Processing {video_info['video_name']}")
+            
+            try:
+                # Check if output video already exists
+                if os.path.exists(output_video_path) and not force_reprocess:
+                    logging.info(f"Video already exists, skipping: {output_video_path}")
+                    skipped_count += 1
+                    continue
+                
+                # Check if CSV exists
+                if not os.path.exists(csv_path):
+                    logging.warning(f"CSV not found, skipping: {csv_path}")
+                    error_count += 1
+                    continue
+                
+                # Create MediaPipe visualization
+                logging.info(f"Creating visualization: {video_path} -> {output_video_path}")
+                self.create_landmark_visualization_from_csv(
+                    video_path, 
+                    csv_path, 
+                    output_video_path,
+                    None  # Use original video FPS
+                )
+                
+                # Verify video was created
+                if os.path.exists(output_video_path):
+                    processed_count += 1
+                    logging.info(f"Successfully created: {output_video_name}")
+                else:
+                    error_count += 1
+                    logging.error(f"Failed to create video: {output_video_path}")
+                    
+            except Exception as e:
+                error_count += 1
+                logging.error(f"Error processing {video_info['video_name']}: {e}")
+        
+        pbar.close()
+        
+        # Print summary
+        logging.info("="*50)
+        logging.info("BATCH VISUALIZATION SUMMARY")
+        logging.info("="*50)
+        logging.info(f"Total videos found: {len(video_files)}")
+        logging.info(f"Successfully processed: {processed_count}")
+        logging.info(f"Skipped (already exists): {skipped_count}")
+        logging.info(f"Errors: {error_count}")
+        logging.info("="*50)
+        
+        return {'processed': processed_count, 'skipped': skipped_count, 'errors': error_count}
+
 def main():
     parser = argparse.ArgumentParser(description='Create MediaPipe visualization from CSV landmarks')
-    parser.add_argument('video_path', help='Path to input video file')
-    parser.add_argument('csv_path', help='Path to CSV file with MediaPipe landmarks')
-    parser.add_argument('--output', '-o', help='Output video file path')
-    parser.add_argument('--fps', type=int, default=30, help='Target output FPS')
+    parser.add_argument('--video_path', help='Path to input video file (for single video processing)')
+    parser.add_argument('--csv_path', help='Path to CSV file with MediaPipe landmarks (for single video processing)')
+    parser.add_argument('--videoset_path', help='Path to videoset folder for batch processing (e.g., /path/to/videoset)')
+    parser.add_argument('--dataset_path', help='Path to dataset folder for batch processing (e.g., /path/to/dataset)')
+    parser.add_argument('--output', '-o', help='Output video file path (for single video processing)')
+    parser.add_argument('--fps', type=int, default=None, help='Target output FPS (default: use original video FPS)')
+    parser.add_argument('--force_reprocess', action='store_true', help='Force reprocessing of existing videos')
+    parser.add_argument('--gpu_num', type=int, default=0, help='GPU device number to use (default: 0)')
     
     args = parser.parse_args()
     
-    # Set default output path if not provided - simplified naming
-    if args.output is None:
-        video_name = Path(args.video_path).stem
-        args.output = f"recreated_videos/{video_name}_mediapipe_landmarks.mp4"
-    
-    # Create visualizer and process
-    visualizer = MediaPipeVisualizer()
-    visualizer.create_landmark_visualization_from_csv(
-        args.video_path, 
-        args.csv_path, 
-        args.output, 
-        args.fps
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
+    
+    # Create visualizer
+    visualizer = MediaPipeVisualizer(args.gpu_num)
+    
+    # Check if batch processing is requested
+    if args.videoset_path and args.dataset_path:
+        logging.info("Starting batch processing mode...")
+        results = visualizer.process_all_videos(
+            videoset_path=args.videoset_path,
+            dataset_path=args.dataset_path,
+            force_reprocess=args.force_reprocess
+        )
+        logging.info(f"Batch processing completed: {results}")
+        
+    elif args.video_path and args.csv_path:
+        # Single video processing
+        logging.info("Starting single video processing mode...")
+        
+        # Set default output path if not provided
+        if args.output is None:
+            video_name = Path(args.video_path).stem
+            args.output = f"recreated_videos/{video_name}_mediapipe_landmarks.mp4"
+        
+        # Create output directory
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        
+        visualizer.create_landmark_visualization_from_csv(
+            args.video_path, 
+            args.csv_path, 
+            args.output, 
+            args.fps  # Use provided FPS or None for original video FPS
+        )
+        logging.info(f"Single video processing completed: {args.output}")
+        
+    else:
+        logging.error("Please provide either --video_path and --csv_path for single video processing, or --videoset_path and --dataset_path for batch processing")
+        parser.print_help()
 
 if __name__ == "__main__":
     main() 

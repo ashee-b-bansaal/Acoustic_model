@@ -492,32 +492,24 @@ def read_label_groups(label_file):
     return labels, groups, group_blocks
 
 def save_cm_figure(true_label,predict_label, best_save_path, acc, lst): 
-    # Use the filtered label list instead of reading from file
-    ordered_labels = lst  # Use the filtered list you defined
+    # Read label order and groupings from file
+    label_file = './classification_confusing_signs.txt'
+    ordered_labels, label_groups, group_blocks = read_label_groups(label_file)
     label_to_idx = {label: i for i, label in enumerate(ordered_labels)}
 
     # Map true/pred labels to indices in the new order
     true_labels = []
     for i in true_label:
         label = i.strip()
-        if label in label_to_idx:  # Only include labels that are in our filtered list
-            true_labels.append(label_to_idx[label])
-        else:
-            print(f"Label '{label}' not in filtered list, skipping...")
-    
+        if label not in label_to_idx:
+            print(f"Label '{label}' not found in label_to_idx!")
+        true_labels.append(label_to_idx[label])
     predicted_labels = []
     for i in predict_label:
         label = i.strip()
-        if label in label_to_idx:  # Only include labels that are in our filtered list
-            predicted_labels.append(label_to_idx[label])
-        else:
-            print(f"Label '{label}' not in filtered list, skipping...")
-    
-    # Only proceed if we have valid labels
-    if len(true_labels) == 0 or len(predicted_labels) == 0:
-        print("No valid labels found for confusion matrix!")
-        return
-    
+        if label not in label_to_idx:
+            print(f"Label '{label}' not found in label_to_idx!")
+        predicted_labels.append(label_to_idx[label])
     unique_classes = ordered_labels
     
     # Compute confusion matrix
@@ -858,26 +850,10 @@ for i in org_sessions:
             loaded_gt_set.append(label)
 
 
-# Filtered label list based on user requirements
-lst = [
-    'address', 'alone', 'always', 'bad', 'bathroom', 'bicycle', 'birthday', 
-    'black', 'bread', 'breath', 'business', 'buy', 'celebrate', 'chocolate', 
-    'church', 'class', 'computer', 'cry', 'date(romantic_outing)', 'dessert', 
-    "doesn't_matter", 'dry', 'family', 'favorite', 'first', 'football', 
-    'frustrated', 'gain', 'good', 'gray', 'gym', 'important', 'late', 'live', 
-    'lonely', 'mean(cruel)', 'medium_average', 'mine', 'money', 'movie', 
-    'music', 'normal', 'not', 'not_yet', 'of_course', 'only_just', 'pet', 
-    'please', 'punish', 'red', 'scared', 'each_other', 'science', 'sell', 
-    'share', 'shopping', 'show', 'sick', 'single', 'socks', 'sorrowful', 
-    'sorry', 'star', 'stay', 'store', 'summer', 'summon', 'sunday', 'sweet', 
-    'today', 'tomorrow', 'ugly', 'warning', 'weekend', 'where', 'wonderful', 
-    'wood', 'worried', 'wrestling', 'your'
-]
-
-
-# Remove duplicates and sort
-lst = sorted(list(set(lst)))
-print_and_log(f"Using filtered label list with {len(lst)} labels:")
+# lst = ['LIKE', 'FAST', 'YES', 'DRIVE', 'WHY', 'I', 'SHE', 'WHO', 'YOU']
+# lst = ['A', 'B','C','D', 'E','F','G', 'H','I','J', 'K','L','M', 'N','O','P', 'Q','R','S', 'T','U','V', 'W','X', 'Y', 'Z']
+lst = list(set(loaded_gt_set))
+lst = sorted(lst)
 print_and_log(lst)
 label_dic =  {value: index for index, value in enumerate(lst)}
 label_dic_reverse = {index: value for index, value in enumerate(lst)}
