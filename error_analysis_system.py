@@ -617,7 +617,19 @@ class ErrorAnalysisSystem:
         
         # Save fold analysis
         with open(f'{self.output_dir}/fold_wise_analysis.json', 'w') as f:
-            json.dump(fold_analysis, f, indent=2)
+            # Convert numpy types to Python native types for JSON serialization
+            def convert_numpy_types(obj):
+                if isinstance(obj, dict):
+                    return {str(k): convert_numpy_types(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numpy_types(item) for item in obj]
+                elif hasattr(obj, 'item'):  # numpy scalar types
+                    return obj.item()
+                else:
+                    return obj
+            
+            fold_analysis_serializable = convert_numpy_types(fold_analysis)
+            json.dump(fold_analysis_serializable, f, indent=2)
         
         logging.info("Fold-wise analysis completed")
     
@@ -1516,12 +1528,12 @@ class ErrorAnalysisSystem:
     
     def plot_error_distribution(self):
         """Plot error case distribution."""
-        if not self.error_cases:
+        if self.error_cases.empty:
             return
         
         # Analyze error patterns
-        error_labels = [case['true_label'] for case in self.error_cases]
-        predicted_labels = [case['predicted_label'] for case in self.error_cases]
+        error_labels = self.error_cases['True Label'].tolist()
+        predicted_labels = self.error_cases['Predicted Label'].tolist()
         
         # Create confusion matrix for errors
         cm = confusion_matrix(error_labels, predicted_labels)
@@ -1551,14 +1563,14 @@ class ErrorAnalysisSystem:
     
     def plot_confidence_motion_correlation(self):
         """Plot correlation between confidence and motion metrics."""
-        if not self.error_cases:
+        if self.error_cases.empty:
             return
         
         # Extract confidence and motion data
         confidences = []
         motion_velocities = []
         
-        for case in self.error_cases:
+        for idx, case in self.error_cases.iterrows():
             if 'confidence' in case and 'landmark_analysis' in case:
                 confidences.append(case['confidence'])
                 if case['landmark_analysis'] and 'hand_motion' in case['landmark_analysis']:
@@ -1593,12 +1605,31 @@ class ErrorAnalysisSystem:
         """Create video visualizations for error cases."""
         logging.info("Creating error case video visualizations...")
         
+        # Check if we have video information
+        if not hasattr(self, 'video_dataset_path') or not self.video_dataset_path:
+            logging.warning("No video dataset path provided. Skipping video creation.")
+            return
+            
+        # Check if we have video name column
+        video_name_columns = ['Video_Name', 'video_name', 'filename', 'file_name', 'video_path']
+        available_video_column = None
+        for col in video_name_columns:
+            if col in self.error_cases.columns:
+                available_video_column = col
+                break
+        
+        if not available_video_column:
+            logging.warning("No video name column found in test results. Video creation requires video file information.")
+            logging.info("Available columns: " + ", ".join(self.error_cases.columns))
+            logging.info("To enable video creation, ensure test_results.csv includes video file names.")
+            return
+        
         error_videos_dir = f'{self.output_dir}/error_videos'
         os.makedirs(error_videos_dir, exist_ok=True)
         
-        for i, case in enumerate(self.error_cases):
+        for i, (idx, case) in enumerate(self.error_cases.iterrows()):
             try:
-                video_name = case['video_name']
+                video_name = case[available_video_column]
                 video_path = self.find_video_path(video_name)
                 
                 if video_path:
@@ -1771,9 +1802,9 @@ class ErrorAnalysisSystem:
         with open(f'{self.output_dir}/key_findings_report.md', 'w') as f:
             f.write("# Error Analysis Key Findings\n\n")
             f.write(f"## Summary\n")
-            f.write(f"- Total cases analyzed: {len(self.acoustic_results)}\n")
-            f.write(f"- Error cases: {len(self.error_cases)} ({len(self.error_cases)/len(self.acoustic_results)*100:.1f}%)\n")
-            f.write(f"- Success cases: {len(self.success_cases)} ({len(self.success_cases)/len(self.acoustic_results)*100:.1f}%)\n\n")
+            f.write(f"- Total cases analyzed: {len(self.error_cases) + len(self.success_cases)}\n")
+            f.write(f"- Error cases: {len(self.error_cases)} ({len(self.error_cases)/(len(self.error_cases) + len(self.success_cases))*100:.1f}%)\n")
+            f.write(f"- Success cases: {len(self.success_cases)} ({len(self.success_cases)/(len(self.error_cases) + len(self.success_cases))*100:.1f}%)\n\n")
             
             f.write("## Key Findings\n\n")
             for finding in findings:
